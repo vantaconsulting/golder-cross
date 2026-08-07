@@ -108,12 +108,19 @@ def dias_hasta_objetivo(df, idx_entrada, idx_fin, objetivo_pct):
 
 
 def evaluar_ticker_hoy(conn, ticker, market_cap, industria):
+    """
+    Regresa (señal_completa, candidato_hoy):
+      - señal_completa: dict con la señal que SÍ pasó todo el criterio (o None)
+      - candidato_hoy: dict con info de que hoy hubo actividad de proyección
+        (aunque no haya pasado el filtro), o None si el ticker ni siquiera
+        está en fase de "acercándose" a un cruce.
+    """
     df = pd.read_sql_query(
         "SELECT fecha, cierre FROM precios_diarios WHERE ticker = ? ORDER BY fecha",
         conn, params=(ticker,)
     )
     if len(df) < MIN_HISTORIA + VENTANA_VALIDACION_DIAS + 1:
-        return None
+        return None, None
 
     df["fecha"] = pd.to_datetime(df["fecha"])
     df["ema50"] = df["cierre"].ewm(span=50, adjust=False).mean()
@@ -140,6 +147,7 @@ def evaluar_ticker_hoy(conn, ticker, market_cap, industria):
 
     eventos_prediccion_previos = []
     en_señal = False
+    candidato_hoy = None
 
     for i in range(MIN_HISTORIA, len(df)):
         hoy = df.iloc[i]
@@ -157,6 +165,7 @@ def evaluar_ticker_hoy(conn, ticker, market_cap, industria):
                 resultados_n.append(n)
 
         es_señal_fuerte = False
+        n_min = None
         if resultados_n:
             n_min = min(resultados_n)
             es_señal_fuerte = (n_min <= MAX_DIAS_ANTICIPACION) and \
@@ -175,6 +184,13 @@ def evaluar_ticker_hoy(conn, ticker, market_cap, industria):
                 n_prev = len(eventos_prediccion_previos)
                 score = (sum(eventos_prediccion_previos) / n_prev * 100) if n_prev >= MIN_PREDICCIONES_PREVIAS_SCORE else None
 
+                # candidato: hoy SÍ hay proyección fuerte de cruce, se guarda pase o no el filtro
+                candidato_hoy = {
+                    "ticker": ticker,
+                    "n_min_dias": n_min,
+                    "score_pct": round(score, 1) if score is not None else None,
+                }
+
                 if score is not None and score >= SCORE_MINIMO:
                     mfes_previos = [mfe_por_cruce[idx_c] for idx_c in dorados_confirmados_ordenados if idx_c < i]
                     if len(mfes_previos) >= MIN_CRUCES_PREVIOS_ADAPTATIVO:
@@ -190,7 +206,7 @@ def evaluar_ticker_hoy(conn, ticker, market_cap, industria):
                     ]
                     hold_estimado_dias = int(np.median(dias_previos)) if dias_previos else None
 
-                    return {
+                    señal_completa = {
                         "ticker": ticker,
                         "industria": industria if industria else "Sin dato",
                         "market_cap_texto": formatear_market_cap(market_cap),
@@ -200,10 +216,11 @@ def evaluar_ticker_hoy(conn, ticker, market_cap, industria):
                         "hold_estimado_dias": hold_estimado_dias,
                         "num_cruces_previos_objetivo": len(mfes_previos),
                     }
+                    return señal_completa, candidato_hoy
         elif not es_señal_fuerte:
             en_señal = False
 
-    return None
+    return None, candidato_hoy
 
 
 def obtener_universo_filtrado(conn):
@@ -221,9 +238,8 @@ def obtener_universo_filtrado(conn):
     return resultado
 
 
-def armar_mensajes(señales):
-    if not señales:
-        return ["📭 Sin señales nuevas hoy que cumplan el criterio validado (score histórico >= 70%)."]
+def armar_mensajes(señales, candidatos, total_universo):
+    from datetime import datetime, timezone
 
     bloques = []
     for s in señales:
@@ -237,18 +253,37 @@ def armar_mensajes(señales):
             f"LINK - 🔗 {link_tradingview}"
         )
 
-    encabezado = f"📊 *{len(señales)} señal(es) de Golden Cross anticipado hoy:*\n"
+    # candidatos: los que están más cerca (n_min más chico) primero
+    candidatos_ordenados = sorted(candidatos, key=lambda c: c["n_min_dias"])[:5]
+    lineas_candidatos = []
+    for c in candidatos_ordenados:
+        score_texto = f"{c['score_pct']:.0f}%" if c["score_pct"] is not None else "SIN HISTORIAL"
+        lineas_candidatos.append(f"  {c['ticker']} — proyecta cruce en ~{c['n_min_dias']}d — SCORE {score_texto}")
 
-    # Telegram tiene límite de ~4096 caracteres por mensaje; se parte en bloques de 10 señales
-    mensajes = []
-    grupo = [encabezado]
-    for i, bloque in enumerate(bloques, 1):
-        grupo.append(bloque)
-        if i % 10 == 0:
+    fecha_texto = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    resumen = (
+        f"GOLDEN CROSS DAILY\n"
+        f"Universo: `{total_universo} stocks`\n"
+        f"Señales hoy: `{len(señales)}`\n"
+        f"Candidatos vigilando: `{len(candidatos)}`\n"
+    )
+    if lineas_candidatos:
+        resumen += "TOP CERCANOS:\n" + "\n".join(lineas_candidatos) + "\n"
+    resumen += fecha_texto
+
+    encabezado = f"📊 *{len(señales)} señal(es) de Golden Cross anticipado hoy:*\n" if señales else None
+
+    mensajes = [resumen]
+    if bloques:
+        grupo = [encabezado]
+        for i, bloque in enumerate(bloques, 1):
+            grupo.append(bloque)
+            if i % 10 == 0:
+                mensajes.append("\n\n".join(grupo))
+                grupo = []
+        if len(grupo) > 1:
             mensajes.append("\n\n".join(grupo))
-            grupo = []
-    if grupo:
-        mensajes.append("\n\n".join(grupo))
     return mensajes
 
 
@@ -264,18 +299,22 @@ def correr():
     print(f"Universo filtrado: {len(universo)} tickers. Evaluando señales de hoy...")
 
     señales = []
+    candidatos = []
     for i, (ticker, market_cap, industria) in enumerate(universo):
-        resultado = evaluar_ticker_hoy(conn, ticker, market_cap, industria)
-        if resultado:
-            señales.append(resultado)
+        señal, candidato = evaluar_ticker_hoy(conn, ticker, market_cap, industria)
+        if señal:
+            señales.append(señal)
             print(f"  ✅ Señal: {ticker}")
+        if candidato:
+            candidatos.append(candidato)
         if i % 500 == 0:
             print(f"  [{i}/{len(universo)}] procesados...")
 
     conn.close()
 
     print(f"\nTotal de señales hoy: {len(señales)}")
-    mensajes = armar_mensajes(señales)
+    print(f"Total de candidatos cercanos: {len(candidatos)}")
+    mensajes = armar_mensajes(señales, candidatos, len(universo))
     for m in mensajes:
         ok = enviar_telegram(m)
         print("  ✅ Enviado a Telegram" if ok else "  ⚠️ Falló el envío a Telegram")
