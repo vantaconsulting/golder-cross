@@ -10,7 +10,7 @@ import sqlite3
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Carga el archivo .env (debe estar en la raíz del proyecto)
+# Carga el archivo .env si existe (en Railway, las variables vienen del entorno directo, no de un .env)
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
@@ -18,7 +18,12 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-DB_PATH = BASE_DIR / "database.db"
+# DATA_DIR: en tu máquina/Codespace, por default es la misma carpeta del proyecto.
+# En Railway, usa automáticamente RAILWAY_VOLUME_MOUNT_PATH (la variable que Railway
+# pone sola al crear un volumen) — así no depende de configurar DATA_DIR a mano.
+# DATA_DIR explícito, si existe, tiene prioridad sobre ambos.
+DATA_DIR = Path(os.getenv("DATA_DIR", os.getenv("RAILWAY_VOLUME_MOUNT_PATH", str(BASE_DIR))))
+DB_PATH = DATA_DIR / "database.db"
 
 POLYGON_BASE_URL = "https://api.polygon.io"
 
