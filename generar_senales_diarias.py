@@ -298,13 +298,13 @@ def armar_mensaje_resumen(candidatos_solo_vigilancia, señales_anticipadas, tota
         lineas_precross.append(f"  {s['ticker']} - ~{s['n_min_dias']}D - ↑{s['score_pct']:.0f}%")
 
     fecha_texto = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    titulo = "GOLDEN -- PREVIEW (2h antes del cierre)" if es_previo else "GOLDEN -- DAILY"
+    titulo = "GOLDEN -- PREVIEW" if es_previo else "GOLDEN -- DAILY"
 
     resumen = (
         f"{titulo}\n"
         f"UNIVERSE: `{total_universo} stocks`\n"
         f"GOLDEN CROSS: `{n_confirmadas}`\n"
-        f"PRE-CROSS (score >=70%): `{len(señales_anticipadas)}`\n"
+        f"PRE-CROSS (70%): `{len(señales_anticipadas)}`\n"
         f"UPCOMING: `{len(candidatos_solo_vigilancia)}`\n"
     )
     if lineas_precross:
@@ -315,11 +315,11 @@ def armar_mensaje_resumen(candidatos_solo_vigilancia, señales_anticipadas, tota
     return resumen
 
 
-def armar_mensaje_trade(s, tipo):
+def armar_mensaje_trade(s):
     link_tradingview = f"https://www.tradingview.com/symbols/{s['ticker']}/"
     hold_texto = f"{s['hold_estimado_dias']} D" if s['hold_estimado_dias'] is not None else "N/A"
     return (
-        f"GOLDEN CROSS {tipo}\n"
+        f"GOLDEN TRADE\n"
         f"TRADE - ${s['ticker']}\n"
         f"NAME - {s['nombre_corto']}\n"
         f"INDUSTRY - {s['industria']}\n"
@@ -375,14 +375,11 @@ def correr(solo_resumen=False):
     print("  ✅ Resumen enviado a Telegram" if ok else "  ⚠️ Falló el envío del resumen")
 
     if not solo_resumen:
-        # primero todas las ANTICIPADAS, después todas las CONFIRMADAS — un mensaje por cada una
-        for s in señales_anticipadas:
-            texto = armar_mensaje_trade(s, "ANTICIPADO")
-            ok = enviar_telegram(texto)
-            print(f"  ✅ ANTICIPADA {s['ticker']} enviada" if ok else f"  ⚠️ Falló el envío de {s['ticker']}")
-
+        # TRADE = SOLO cruces confirmados. Las anticipadas (aunque pasen el filtro
+        # de 70%) NUNCA disparan un TRADE — se quedan como información en el
+        # resumen (sección PRE-CROSS), la decisión de actuar sobre ellas es manual.
         for s in señales_confirmadas:
-            texto = armar_mensaje_trade(s, "CONFIRMADO")
+            texto = armar_mensaje_trade(s)
             ok = enviar_telegram(texto)
             print(f"  ✅ CONFIRMADA {s['ticker']} enviada" if ok else f"  ⚠️ Falló el envío de {s['ticker']}")
 
