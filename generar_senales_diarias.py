@@ -1,26 +1,29 @@
 """
-generar_senales_diarias.py
+generar_senales_diarias.py (v2)
 
-Corre TODOS LOS DÍAS (vía Railway cron). Aplica EXACTAMENTE el criterio
-validado en el prospecto:
-  - Universo: NASDAQ+NYSE, market cap >= $300M, sin REITs
-  - Entrada: predicción anticipada (proyección EMA <= 4 días), solo si el
-    ticker tiene >= SCORE_MINIMO% de acierto en sus predicciones PASADAS
-    (walk-forward real, nunca ve el futuro — ni siquiera el de HOY, que
-    todavía no se sabe si se cumplirá).
-  - Objetivo aproximado: calibrado con el historial de ganancia máxima de
-    los cruces CONFIRMADOS pasados de ese mismo ticker (mismo método que
-    la salida adaptativa validada).
+Corre TODOS LOS DÍAS (vía Railway cron). Dos conceptos separados:
 
-Arma un mensaje de Telegram con cada señal del día: empresa, industria,
-market cap, precio de cruce, y % aproximado esperado — y lo manda.
+  1. TRADE (accionable, se manda como mensaje separado por cada uno):
+     Solo se dispara cuando el EMA50 CRUZÓ REALMENTE por encima del EMA200
+     EL DÍA DE HOY (cruce confirmado, no proyección). El objetivo % y el
+     HOLD estimado se calibran con el historial de cruces confirmados
+     PASADOS de ese mismo ticker (walk-forward, sin ver el futuro).
+
+  2. CANDIDATOS (informativo, solo en el resumen diario):
+     Usa el modelo de proyección anticipada (igual que antes) para avisar
+     qué tickers están "a punto de cruzar" en los próximos días — no
+     genera ninguna alerta accionable, es solo para que sepas qué vigilar.
+
+Universo: NASDAQ+NYSE, market cap >= $300M, sin las industrias excluidas.
 
 Corre: python generar_senales_diarias.py
+       python generar_senales_diarias.py --solo-resumen   (para el aviso previo, 2h antes del cron principal)
 """
 
 import numpy as np
 import pandas as pd
 import requests
+from datetime import datetime, timezone
 from config import get_connection, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 MIN_HISTORIA = 250
@@ -45,6 +48,12 @@ INDUSTRIAS_EXCLUIDAS = [
     "WATER SUPPLY",
 ]
 
+SUFIJOS_CORPORATIVOS = [
+    " INCORPORATED", " CORPORATION", " COMPANY", " HOLDINGS", " GROUP",
+    " LIMITED", " INC.", " CORP.", " CO.", " LTD.", " PLC", " INC", " CORP",
+    " CO", " LTD",
+]
+
 
 def formatear_market_cap(mc):
     if mc is None:
@@ -54,6 +63,19 @@ def formatear_market_cap(mc):
     if mc >= 2_000_000_000:
         return f"${mc/1e9:.1f}B (Mid-cap)"
     return f"${mc/1e6:.0f}M (Small-cap)"
+
+
+def acortar_nombre(nombre):
+    """MAYÚSCULAS, sin sufijos corporativos comunes, truncado — para diferenciar
+    tickers parecidos sin depender de ISIN/CUSIP/SEDOL (que Polygon no nos da)."""
+    if not nombre:
+        return "SIN NOMBRE"
+    n = nombre.upper()
+    for suf in SUFIJOS_CORPORATIVOS:
+        if n.endswith(suf):
+            n = n[: -len(suf)]
+    n = n.strip(" .,")
+    return n[:30]
 
 
 def proyectar_ema(precio_supuesto, ema_hoy, span, n):
@@ -98,7 +120,6 @@ def calcular_mfe_pct(df, idx_entrada, idx_fin):
 
 
 def dias_hasta_objetivo(df, idx_entrada, idx_fin, objetivo_pct):
-    """Cuántos días tomó, EN ESE cruce pasado, llegar al objetivo (o hasta el límite si nunca llegó)."""
     precio_entrada = df["cierre"].iloc[idx_entrada]
     for idx in range(idx_entrada, idx_fin + 1):
         ganancia = (df["cierre"].iloc[idx] - precio_entrada) / precio_entrada * 100
@@ -107,13 +128,12 @@ def dias_hasta_objetivo(df, idx_entrada, idx_fin, objetivo_pct):
     return idx_fin - idx_entrada
 
 
-def evaluar_ticker_hoy(conn, ticker, market_cap, industria):
+def evaluar_ticker_hoy(conn, ticker, market_cap, industria, nombre):
     """
     Regresa (señal_completa, candidato_hoy):
-      - señal_completa: dict con la señal que SÍ pasó todo el criterio (o None)
-      - candidato_hoy: dict con info de que hoy hubo actividad de proyección
-        (aunque no haya pasado el filtro), o None si el ticker ni siquiera
-        está en fase de "acercándose" a un cruce.
+      - señal_completa: dict SOLO si hoy hubo un cruce CONFIRMADO real (o None)
+      - candidato_hoy: dict informativo si hay proyección anticipada fuerte
+        hoy (independiente de si señal_completa existe), o None
     """
     df = pd.read_sql_query(
         "SELECT fecha, cierre FROM precios_diarios WHERE ticker = ? ORDER BY fecha",
@@ -143,8 +163,36 @@ def evaluar_ticker_hoy(conn, ticker, market_cap, industria):
     dias_cruce_dorado_real = set(idx for idx, tipo in cruces if tipo == "dorado")
 
     ultimo_idx = len(df) - 1
-    limite_validable = ultimo_idx - VENTANA_VALIDACION_DIAS  # último índice con futuro suficiente para saber si se cumplió
+    limite_validable = ultimo_idx - VENTANA_VALIDACION_DIAS
 
+    # --- 1. SEÑAL COMPLETA (TRADE): cruce CONFIRMADO exactamente hoy ---
+    señal_completa = None
+    if cruces and cruces[-1][0] == ultimo_idx and cruces[-1][1] == "dorado" \
+            and not bool(df["salto_sospechoso"].iloc[ultimo_idx]):
+        mfes_previos = [mfe_por_cruce[idx] for idx in dorados_confirmados_ordenados if idx < ultimo_idx]
+        if len(mfes_previos) >= MIN_CRUCES_PREVIOS_ADAPTATIVO:
+            objetivo_pct = max(float(np.median(mfes_previos)) * CAPTURA_RATIO_ADAPTATIVO, 2.0)
+        else:
+            objetivo_pct = OBJETIVO_FIJO_DEFAULT_PCT
+
+        dias_previos = [
+            dias_hasta_objetivo(df, idx, idx_limite_por_cruce[idx], objetivo_pct)
+            for idx in dorados_confirmados_ordenados if idx < ultimo_idx
+        ]
+        hold_estimado_dias = int(np.median(dias_previos)) if dias_previos else None
+
+        señal_completa = {
+            "ticker": ticker,
+            "nombre_corto": acortar_nombre(nombre),
+            "industria": industria if industria else "Sin dato",
+            "market_cap_texto": formatear_market_cap(market_cap),
+            "precio": df["cierre"].iloc[ultimo_idx],
+            "objetivo_pct": round(objetivo_pct, 1),
+            "hold_estimado_dias": hold_estimado_dias,
+            "num_cruces_previos_objetivo": len(mfes_previos),
+        }
+
+    # --- 2. CANDIDATO (informativo): proyección anticipada, walk-forward ---
     eventos_prediccion_previos = []
     en_señal = False
     candidato_hoy = None
@@ -173,59 +221,27 @@ def evaluar_ticker_hoy(conn, ticker, market_cap, industria):
 
         if es_señal_fuerte and not en_señal:
             en_señal = True
-
             if i <= limite_validable:
-                # evento histórico: ya sabemos si se cumplió -> alimenta el score para el futuro
                 ventana = list(range(i + 1, min(i + 1 + VENTANA_VALIDACION_DIAS, len(df))))
                 idx_cruce_real = next((idx for idx in ventana if idx in dias_cruce_dorado_real), None)
                 eventos_prediccion_previos.append(idx_cruce_real is not None)
             elif i == ultimo_idx:
-                # es HOY: evaluamos si pasa el filtro, sin saber todavía si se cumplirá
                 n_prev = len(eventos_prediccion_previos)
                 score = (sum(eventos_prediccion_previos) / n_prev * 100) if n_prev >= MIN_PREDICCIONES_PREVIAS_SCORE else None
-
-                # candidato: hoy SÍ hay proyección fuerte de cruce, se guarda pase o no el filtro
                 candidato_hoy = {
                     "ticker": ticker,
                     "n_min_dias": n_min,
                     "score_pct": round(score, 1) if score is not None else None,
                 }
-
-                if score is not None and score >= SCORE_MINIMO:
-                    mfes_previos = [mfe_por_cruce[idx_c] for idx_c in dorados_confirmados_ordenados if idx_c < i]
-                    if len(mfes_previos) >= MIN_CRUCES_PREVIOS_ADAPTATIVO:
-                        objetivo_pct = max(float(np.median(mfes_previos)) * CAPTURA_RATIO_ADAPTATIVO, 2.0)
-                    else:
-                        objetivo_pct = OBJETIVO_FIJO_DEFAULT_PCT
-
-                    # HOLD estimado: días que tomó, en los cruces pasados de ESTE ticker,
-                    # llegar a este mismo objetivo % (mediana de esos casos)
-                    dias_previos = [
-                        dias_hasta_objetivo(df, idx_c, idx_limite_por_cruce[idx_c], objetivo_pct)
-                        for idx_c in dorados_confirmados_ordenados if idx_c < i
-                    ]
-                    hold_estimado_dias = int(np.median(dias_previos)) if dias_previos else None
-
-                    señal_completa = {
-                        "ticker": ticker,
-                        "industria": industria if industria else "Sin dato",
-                        "market_cap_texto": formatear_market_cap(market_cap),
-                        "precio": hoy["cierre"],
-                        "score_pct": round(score, 1),
-                        "objetivo_pct": round(objetivo_pct, 1),
-                        "hold_estimado_dias": hold_estimado_dias,
-                        "num_cruces_previos_objetivo": len(mfes_previos),
-                    }
-                    return señal_completa, candidato_hoy
         elif not es_señal_fuerte:
             en_señal = False
 
-    return None, candidato_hoy
+    return señal_completa, candidato_hoy
 
 
 def obtener_universo_filtrado(conn):
     filas = conn.execute("""
-        SELECT ticker, market_cap, industria FROM tickers
+        SELECT ticker, market_cap, industria, nombre FROM tickers
         WHERE activo = 1 AND tipo = 'stock'
     """).fetchall()
     resultado = []
@@ -234,26 +250,11 @@ def obtener_universo_filtrado(conn):
             continue
         if r["industria"] in INDUSTRIAS_EXCLUIDAS:
             continue
-        resultado.append((r["ticker"], r["market_cap"], r["industria"]))
+        resultado.append((r["ticker"], r["market_cap"], r["industria"], r["nombre"]))
     return resultado
 
 
-def armar_mensajes(señales, candidatos, total_universo):
-    from datetime import datetime, timezone
-
-    bloques = []
-    for s in señales:
-        hold_texto = f"{s['hold_estimado_dias']} días" if s['hold_estimado_dias'] is not None else "N/A"
-        link_tradingview = f"https://www.tradingview.com/symbols/{s['ticker']}/"
-        bloques.append(
-            f"TRADE - ${s['ticker']}\n"
-            f"LONG - ${s['precio']:.2f}\n"
-            f"% EST - {s['objetivo_pct']:.1f}%\n"
-            f"HOLD - {hold_texto}\n"
-            f"LINK - 🔗 {link_tradingview}"
-        )
-
-    # candidatos: los que están más cerca (n_min más chico) primero
+def armar_mensaje_resumen(candidatos, total_universo, total_señales, es_previo=False):
     candidatos_ordenados = sorted(candidatos, key=lambda c: c["n_min_dias"])[:5]
     lineas_candidatos = []
     for c in candidatos_ordenados:
@@ -261,30 +262,32 @@ def armar_mensajes(señales, candidatos, total_universo):
         lineas_candidatos.append(f"  {c['ticker']} — proyecta cruce en ~{c['n_min_dias']}d — SCORE {score_texto}")
 
     fecha_texto = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    titulo = "GOLDEN CROSS PREVIEW (2h antes del cierre)" if es_previo else "GOLDEN CROSS DAILY"
 
     resumen = (
-        f"GOLDEN CROSS DAILY\n"
+        f"{titulo}\n"
         f"Universo: `{total_universo} stocks`\n"
-        f"Señales hoy: `{len(señales)}`\n"
+        f"Cruces confirmados hoy: `{total_señales}`\n"
         f"Candidatos vigilando: `{len(candidatos)}`\n"
     )
     if lineas_candidatos:
         resumen += "TOP CERCANOS:\n" + "\n".join(lineas_candidatos) + "\n"
     resumen += fecha_texto
+    return resumen
 
-    encabezado = f"📊 *{len(señales)} señal(es) de Golden Cross anticipado hoy:*\n" if señales else None
 
-    mensajes = [resumen]
-    if bloques:
-        grupo = [encabezado]
-        for i, bloque in enumerate(bloques, 1):
-            grupo.append(bloque)
-            if i % 10 == 0:
-                mensajes.append("\n\n".join(grupo))
-                grupo = []
-        if len(grupo) > 1:
-            mensajes.append("\n\n".join(grupo))
-    return mensajes
+def armar_mensaje_trade(s):
+    link_tradingview = f"https://www.tradingview.com/symbols/{s['ticker']}/"
+    hold_texto = f"{s['hold_estimado_dias']} días" if s['hold_estimado_dias'] is not None else "N/A"
+    return (
+        f"TRADE - ${s['ticker']}\n"
+        f"NAME - {s['nombre_corto']}\n"
+        f"INDUSTRY - {s['industria']}\n"
+        f"LONG - ${s['precio']:.2f}\n"
+        f"% EST - {s['objetivo_pct']:.1f}%\n"
+        f"HOLD - {hold_texto}\n"
+        f"LINK - 🔗 {link_tradingview}"
+    )
 
 
 def enviar_telegram(texto):
@@ -293,18 +296,18 @@ def enviar_telegram(texto):
     return r.status_code == 200
 
 
-def correr():
+def correr(solo_resumen=False):
     conn = get_connection()
     universo = obtener_universo_filtrado(conn)
-    print(f"Universo filtrado: {len(universo)} tickers. Evaluando señales de hoy...")
+    print(f"Universo filtrado: {len(universo)} tickers. Evaluando {'(modo preview)' if solo_resumen else ''} señales de hoy...")
 
     señales = []
     candidatos = []
-    for i, (ticker, market_cap, industria) in enumerate(universo):
-        señal, candidato = evaluar_ticker_hoy(conn, ticker, market_cap, industria)
+    for i, (ticker, market_cap, industria, nombre) in enumerate(universo):
+        señal, candidato = evaluar_ticker_hoy(conn, ticker, market_cap, industria, nombre)
         if señal:
             señales.append(señal)
-            print(f"  ✅ Señal: {ticker}")
+            print(f"  ✅ TRADE confirmado: {ticker}")
         if candidato:
             candidatos.append(candidato)
         if i % 500 == 0:
@@ -312,13 +315,24 @@ def correr():
 
     conn.close()
 
-    print(f"\nTotal de señales hoy: {len(señales)}")
-    print(f"Total de candidatos cercanos: {len(candidatos)}")
-    mensajes = armar_mensajes(señales, candidatos, len(universo))
-    for m in mensajes:
-        ok = enviar_telegram(m)
-        print("  ✅ Enviado a Telegram" if ok else "  ⚠️ Falló el envío a Telegram")
+    print(f"\nTotal de TRADEs (cruce confirmado) hoy: {len(señales)}")
+    print(f"Total de candidatos cercanos (informativo): {len(candidatos)}")
+
+    resumen = armar_mensaje_resumen(candidatos, len(universo), len(señales), es_previo=solo_resumen)
+    ok = enviar_telegram(resumen)
+    print("  ✅ Resumen enviado a Telegram" if ok else "  ⚠️ Falló el envío del resumen")
+
+    if not solo_resumen:
+        for s in señales:
+            texto = armar_mensaje_trade(s)
+            ok = enviar_telegram(texto)
+            print(f"  ✅ TRADE {s['ticker']} enviado" if ok else f"  ⚠️ Falló el envío de {s['ticker']}")
 
 
 if __name__ == "__main__":
-    correr()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--solo-resumen", action="store_true",
+                         help="Solo manda el resumen/preview, sin disparar TRADEs (para la corrida 2h antes del cron principal)")
+    args = parser.parse_args()
+    correr(solo_resumen=args.solo_resumen)
