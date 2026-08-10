@@ -277,7 +277,10 @@ def obtener_universo_filtrado(conn):
     """).fetchall()
     resultado = []
     for r in filas:
-        if r["market_cap"] is not None and r["market_cap"] < MARKET_CAP_MINIMO:
+        # excluye tanto market cap bajo COMO market cap desconocido ("Sin dato").
+        # el analisis (analizar_filtros_confirmado.py, Prueba 3) mostro que los
+        # tickers sin market cap tienen 29.58% de acierto -- peor que un volado.
+        if r["market_cap"] is None or r["market_cap"] < MARKET_CAP_MINIMO:
             continue
         if r["industria"] in INDUSTRIAS_EXCLUIDAS:
             continue
