@@ -39,6 +39,14 @@ SCORE_MINIMO = 70.0
 MARKET_CAP_MINIMO = 300_000_000
 DRAWDOWN_52W_MINIMO = -50.0  # límite inferior: no más de -50% desde el máximo de 52 semanas
 DRAWDOWN_52W_MAXIMO = -20.0  # límite superior: al menos -20% desde el máximo (evita "ruido" leve)
+
+# Las mega-caps (>=$20B) casi nunca caen 20-50% (confirmado con datos: solo 5.8% de sus
+# cruces caen en ese rango, vs. 30.5% en small-caps) -- el filtro estándar las excluía casi
+# por completo. Usan un rango más angosto y superficial, propio de su volatilidad menor.
+# Como todas las señales se revisan a mano de todas formas, no hace falta ser tan estricto aquí.
+MEGA_CAP_UMBRAL = 20_000_000_000
+DRAWDOWN_MEGACAP_MINIMO = -15.0
+DRAWDOWN_MEGACAP_MAXIMO = -5.0
 INDUSTRIAS_EXCLUIDAS = [
     "REAL ESTATE INVESTMENT TRUSTS",
     "SERVICES-BUSINESS SERVICES, NEC",
@@ -191,18 +199,23 @@ def evaluar_ticker_hoy(conn, ticker, market_cap, industria, nombre):
         return objetivo_pct, hold_estimado_dias, len(mfes_previos)
 
     # --- 1. SEÑAL CONFIRMADA: cruce CONFIRMADO exactamente hoy, DENTRO del rango
-    #        de drawdown validado (20%-50% desde el máximo de 52 semanas) ---
+    #        de drawdown validado (rango distinto para mega-caps, ver constantes) ---
     señal_confirmada = None
     if cruces and cruces[-1][0] == ultimo_idx and cruces[-1][1] == "dorado" \
             and not bool(df["salto_sospechoso"].iloc[ultimo_idx]):
         precio_hoy = df["cierre"].iloc[ultimo_idx]
         max_52w_val = df["max_52w"].iloc[ultimo_idx]
 
+        if market_cap is not None and market_cap >= MEGA_CAP_UMBRAL:
+            dd_minimo, dd_maximo = DRAWDOWN_MEGACAP_MINIMO, DRAWDOWN_MEGACAP_MAXIMO
+        else:
+            dd_minimo, dd_maximo = DRAWDOWN_52W_MINIMO, DRAWDOWN_52W_MAXIMO
+
         drawdown_ok = False
         drawdown_52w_pct = None
         if pd.notna(max_52w_val) and max_52w_val > 0:
             drawdown_52w_pct = (precio_hoy / max_52w_val - 1) * 100
-            drawdown_ok = DRAWDOWN_52W_MINIMO <= drawdown_52w_pct <= DRAWDOWN_52W_MAXIMO
+            drawdown_ok = dd_minimo <= drawdown_52w_pct <= dd_maximo
 
         if drawdown_ok:
             objetivo_pct, hold_estimado_dias, n_mfes = calcular_objetivo_y_hold(ultimo_idx)
