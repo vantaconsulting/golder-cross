@@ -275,6 +275,7 @@ def evaluar_ticker_hoy(conn, ticker, market_cap, industria, nombre):
                     "ticker": ticker,
                     "n_min_dias": n_min,
                     "score_pct": round(score, 1) if score is not None else None,
+                    "market_cap": market_cap,
                 }
 
                 # señal_anticipada (accionable): SOLO si pasa el filtro de score
@@ -284,6 +285,7 @@ def evaluar_ticker_hoy(conn, ticker, market_cap, industria, nombre):
                         "ticker": ticker,
                         "nombre_corto": acortar_nombre(nombre),
                         "industria": industria if industria else "Sin dato",
+                        "market_cap": market_cap,
                         "market_cap_texto": formatear_market_cap(market_cap),
                         "precio": hoy["cierre"],
                         "score_pct": round(score, 1),
@@ -338,6 +340,16 @@ def armar_mensaje_resumen(candidatos_solo_vigilancia, señales_anticipadas, tota
         f"PRE-CROSS (70%): `{len(señales_anticipadas)}`\n"
         f"UPCOMING: `{len(candidatos_solo_vigilancia)}`\n"
     )
+
+    # ¿hay algún mega-cap (>=$20B) acercándose, en PRE-CROSS o UPCOMING?
+    candidatos_mega = [
+        c for c in (candidatos_solo_vigilancia + señales_anticipadas)
+        if c.get("market_cap") is not None and c["market_cap"] >= MEGA_CAP_UMBRAL
+    ]
+    if candidatos_mega:
+        mas_cercano = min(candidatos_mega, key=lambda c: c["n_min_dias"])
+        resumen += f"⭐ MEGA-CAP EN CAMINO: {mas_cercano['ticker']} - ~{mas_cercano['n_min_dias']}D\n"
+
     if lineas_precross:
         resumen += "PRE-CROSS:\n" + "\n".join(lineas_precross) + "\n"
     if lineas_upcoming:
