@@ -37,6 +37,8 @@ MIN_CRUCES_PREVIOS_ADAPTATIVO = 2
 MIN_PREDICCIONES_PREVIAS_SCORE = 2
 SCORE_MINIMO = 70.0
 MARKET_CAP_MINIMO = 300_000_000
+DRAWDOWN_52W_MINIMO = -50.0  # límite inferior: no más de -50% desde el máximo de 52 semanas
+DRAWDOWN_52W_MAXIMO = -20.0  # límite superior: al menos -20% desde el máximo (evita "ruido" leve)
 INDUSTRIAS_EXCLUIDAS = [
     "REAL ESTATE INVESTMENT TRUSTS",
     "SERVICES-BUSINESS SERVICES, NEC",
@@ -49,7 +51,7 @@ INDUSTRIAS_EXCLUIDAS = [
 ]
 
 SUFIJOS_CORPORATIVOS = [
-    " COMMON STOCK", " ORDINARY SHARES", " COMMON SHARES",
+    " COMMON STOCK", " CAPITAL STOCK", " ORDINARY SHARES", " COMMON SHARES",
     " CLASS A", " CLASS B", " CLASS C",
     " INCORPORATED", " CORPORATION", " COMPANY", " HOLDINGS", " GROUP",
     " LIMITED", " INC.", " CORP.", " CO.", " LTD.", " PLC", " INC", " CORP",
@@ -156,6 +158,7 @@ def evaluar_ticker_hoy(conn, ticker, market_cap, industria, nombre):
     df["ema200"] = df["cierre"].ewm(span=200, adjust=False).mean()
     df["cambio_pct"] = df["cierre"].pct_change().abs()
     df["salto_sospechoso"] = df["cambio_pct"] > UMBRAL_SALTO_SOSPECHOSO
+    df["max_52w"] = df["cierre"].rolling(window=252, min_periods=100).max()
 
     cruces = encontrar_cruces(df, "ema50", "ema200")
     mfe_por_cruce = {}
@@ -187,21 +190,33 @@ def evaluar_ticker_hoy(conn, ticker, market_cap, industria, nombre):
         hold_estimado_dias = int(np.median(dias_previos)) if dias_previos else None
         return objetivo_pct, hold_estimado_dias, len(mfes_previos)
 
-    # --- 1. SEÑAL CONFIRMADA: cruce CONFIRMADO exactamente hoy ---
+    # --- 1. SEÑAL CONFIRMADA: cruce CONFIRMADO exactamente hoy, DENTRO del rango
+    #        de drawdown validado (20%-50% desde el máximo de 52 semanas) ---
     señal_confirmada = None
     if cruces and cruces[-1][0] == ultimo_idx and cruces[-1][1] == "dorado" \
             and not bool(df["salto_sospechoso"].iloc[ultimo_idx]):
-        objetivo_pct, hold_estimado_dias, n_mfes = calcular_objetivo_y_hold(ultimo_idx)
-        señal_confirmada = {
-            "ticker": ticker,
-            "nombre_corto": acortar_nombre(nombre),
-            "industria": industria if industria else "Sin dato",
-            "market_cap_texto": formatear_market_cap(market_cap),
-            "precio": df["cierre"].iloc[ultimo_idx],
-            "objetivo_pct": round(objetivo_pct, 1),
-            "hold_estimado_dias": hold_estimado_dias,
-            "num_cruces_previos_objetivo": n_mfes,
-        }
+        precio_hoy = df["cierre"].iloc[ultimo_idx]
+        max_52w_val = df["max_52w"].iloc[ultimo_idx]
+
+        drawdown_ok = False
+        drawdown_52w_pct = None
+        if pd.notna(max_52w_val) and max_52w_val > 0:
+            drawdown_52w_pct = (precio_hoy / max_52w_val - 1) * 100
+            drawdown_ok = DRAWDOWN_52W_MINIMO <= drawdown_52w_pct <= DRAWDOWN_52W_MAXIMO
+
+        if drawdown_ok:
+            objetivo_pct, hold_estimado_dias, n_mfes = calcular_objetivo_y_hold(ultimo_idx)
+            señal_confirmada = {
+                "ticker": ticker,
+                "nombre_corto": acortar_nombre(nombre),
+                "industria": industria if industria else "Sin dato",
+                "market_cap_texto": formatear_market_cap(market_cap),
+                "precio": precio_hoy,
+                "drawdown_52w_pct": round(drawdown_52w_pct, 1),
+                "objetivo_pct": round(objetivo_pct, 1),
+                "hold_estimado_dias": hold_estimado_dias,
+                "num_cruces_previos_objetivo": n_mfes,
+            }
 
     # --- 2. PROYECCIÓN ANTICIPADA: walk-forward, genera candidato SIEMPRE,
     #        y señal_anticipada SOLO si pasa el filtro de score >= 70% ---
@@ -327,6 +342,7 @@ def armar_mensaje_trade(s):
         f"NAME - {s['nombre_corto']}\n"
         f"INDUSTRY - {s['industria']}\n"
         f"LONG - ${s['precio']:.2f}\n"
+        f"DD 52W - {s['drawdown_52w_pct']:.1f}%\n"
         f"% EST - ↑{s['objetivo_pct']:.1f}%\n"
         f"HOLD - {hold_texto}\n"
         f"LINK - 🔗 {link_tradingview}"
