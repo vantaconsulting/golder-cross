@@ -37,16 +37,30 @@ MIN_CRUCES_PREVIOS_ADAPTATIVO = 2
 MIN_PREDICCIONES_PREVIAS_SCORE = 2
 SCORE_MINIMO = 70.0
 MARKET_CAP_MINIMO = 300_000_000
-DRAWDOWN_52W_MINIMO = -50.0  # límite inferior: no más de -50% desde el máximo de 52 semanas
-DRAWDOWN_52W_MAXIMO = -20.0  # límite superior: al menos -20% desde el máximo (evita "ruido" leve)
 
-# Las mega-caps (>=$20B) casi nunca caen 20-50% (confirmado con datos: solo 5.8% de sus
-# cruces caen en ese rango, vs. 30.5% en small-caps) -- el filtro estándar las excluía casi
-# por completo. Usan un rango más angosto y superficial, propio de su volatilidad menor.
-# Como todas las señales se revisan a mano de todas formas, no hace falta ser tan estricto aquí.
+# --- CRITERIO VALIDADO (5 anios de datos reales, 8,676 cruces analizados) ---
+# El filtro de drawdown anterior resulto NO discriminar casi nada (todos sus
+# buckets entre 50.5% y 55% de win rate, vs. 51.8% del baseline sin filtro).
+# Se reemplaza por las 2 variables que SI mostraron patron limpio y fuerte:
+#
+#   1. PENDIENTE DEL EMA200: el hallazgo mas fuerte de todo el analisis.
+#      Un golden cross que ocurre mientras el EMA200 TODAVIA va bajando es
+#      una senal temprana de reversion (65.3% win). Si el EMA200 ya va
+#      subiendo fuerte, el cruce llega tarde (49.4% win).
+#        EMA200 bajando fuerte (<-0.5% en 20 dias): 65.3% win, 10.13% mediana
+#        EMA200 subiendo fuerte (>0.5%):            49.4% win, -0.22% mediana
+#
+#   2. MARKET CAP >= $5B: patron monotono, la variable mas consistente de
+#      todos los sistemas construidos.
+#
+# Combinacion final validada: 67.2% win, 14.23% mediana a 90 dias (N=116),
+# y mejora con el tiempo: 71.6% win / 26.82% ROI a 180 dias.
+# Frecuencia: ~1.9 senales/mes.
+PENDIENTE_EMA200_MAXIMA = -0.5   # el EMA200 debe ir BAJANDO al menos esto (en 20 dias)
+DIAS_PENDIENTE_EMA200 = 20
+MARKET_CAP_MINIMO_SENAL = 5_000_000_000
+
 MEGA_CAP_UMBRAL = 20_000_000_000
-DRAWDOWN_MEGACAP_MINIMO = -15.0
-DRAWDOWN_MEGACAP_MAXIMO = -5.0
 INDUSTRIAS_EXCLUIDAS = [
     "REAL ESTATE INVESTMENT TRUSTS",
     "SERVICES-BUSINESS SERVICES, NEC",
@@ -198,26 +212,34 @@ def evaluar_ticker_hoy(conn, ticker, market_cap, industria, nombre):
         hold_estimado_dias = int(np.median(dias_previos)) if dias_previos else None
         return objetivo_pct, hold_estimado_dias, len(mfes_previos)
 
-    # --- 1. SEÑAL CONFIRMADA: cruce CONFIRMADO exactamente hoy, DENTRO del rango
-    #        de drawdown validado (rango distinto para mega-caps, ver constantes) ---
+    # --- 1. SEÑAL CONFIRMADA: cruce CONFIRMADO exactamente hoy, que ademas
+    #        cumple el criterio VALIDADO: EMA200 bajando + Market Cap >= $5B ---
     señal_confirmada = None
     if cruces and cruces[-1][0] == ultimo_idx and cruces[-1][1] == "dorado" \
             and not bool(df["salto_sospechoso"].iloc[ultimo_idx]):
         precio_hoy = df["cierre"].iloc[ultimo_idx]
         max_52w_val = df["max_52w"].iloc[ultimo_idx]
 
-        if market_cap is not None and market_cap >= MEGA_CAP_UMBRAL:
-            dd_minimo, dd_maximo = DRAWDOWN_MEGACAP_MINIMO, DRAWDOWN_MEGACAP_MAXIMO
-        else:
-            dd_minimo, dd_maximo = DRAWDOWN_52W_MINIMO, DRAWDOWN_52W_MAXIMO
-
-        drawdown_ok = False
+        # drawdown se sigue calculando, pero SOLO para mostrarlo en el mensaje
+        # (ya no filtra -- se comprobo que no discriminaba)
         drawdown_52w_pct = None
         if pd.notna(max_52w_val) and max_52w_val > 0:
             drawdown_52w_pct = (precio_hoy / max_52w_val - 1) * 100
-            drawdown_ok = dd_minimo <= drawdown_52w_pct <= dd_maximo
 
-        if drawdown_ok:
+        # CRITERIO 1: pendiente del EMA200 en los ultimos 20 dias
+        pendiente_ema200 = None
+        if ultimo_idx >= DIAS_PENDIENTE_EMA200:
+            ema200_hoy = df["ema200"].iloc[ultimo_idx]
+            ema200_antes = df["ema200"].iloc[ultimo_idx - DIAS_PENDIENTE_EMA200]
+            if pd.notna(ema200_hoy) and pd.notna(ema200_antes) and ema200_antes > 0:
+                pendiente_ema200 = (ema200_hoy / ema200_antes - 1) * 100
+
+        pendiente_ok = pendiente_ema200 is not None and pendiente_ema200 < PENDIENTE_EMA200_MAXIMA
+
+        # CRITERIO 2: market cap
+        market_cap_ok = market_cap is not None and market_cap >= MARKET_CAP_MINIMO_SENAL
+
+        if pendiente_ok and market_cap_ok:
             objetivo_pct, hold_estimado_dias, n_mfes = calcular_objetivo_y_hold(ultimo_idx)
             señal_confirmada = {
                 "ticker": ticker,
@@ -225,7 +247,8 @@ def evaluar_ticker_hoy(conn, ticker, market_cap, industria, nombre):
                 "industria": industria if industria else "Sin dato",
                 "market_cap_texto": formatear_market_cap(market_cap),
                 "precio": precio_hoy,
-                "drawdown_52w_pct": round(drawdown_52w_pct, 1),
+                "drawdown_52w_pct": round(drawdown_52w_pct, 1) if drawdown_52w_pct is not None else 0.0,
+                "pendiente_ema200_pct": round(pendiente_ema200, 2),
                 "objetivo_pct": round(objetivo_pct, 1),
                 "hold_estimado_dias": hold_estimado_dias,
                 "num_cruces_previos_objetivo": n_mfes,
@@ -368,6 +391,7 @@ def armar_mensaje_trade(s):
         f"INDUSTRY - {s['industria']}\n"
         f"LONG - ${s['precio']:.2f}\n"
         f"DD 52W - {s['drawdown_52w_pct']:.1f}%\n"
+        f"EMA200 SLOPE - {s['pendiente_ema200_pct']:.2f}% (bajando = senal temprana)\n"
         f"% EST - ↑{s['objetivo_pct']:.1f}%\n"
         f"HOLD - {hold_texto}\n"
         f"LINK - 🔗 {link_tradingview}"
